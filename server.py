@@ -307,38 +307,316 @@ async def bank_transactions_list(profile: str | None = None, page: int | None = 
 
 @mcp.tool(
     description=(
-        "Run a Xero financial report. The CLI exposes a fixed set of report "
-        "names — pass one of them, plus optional date params depending on the "
-        "report. Common reports: BalanceSheet, ProfitAndLoss, TrialBalance, "
-        "AgedReceivables, AgedPayables, BankSummary.\n"
+        "Generate a Balance Sheet report. Point-in-time view of assets, "
+        "liabilities and equity as of a given date.\n"
         "Args:\n"
         "  profile: Xero profile name\n"
-        "  report: Report name (case-insensitive; CLI normalises)\n"
-        "  date: Effective date (YYYY-MM-DD) for point-in-time reports\n"
-        "  from_date / to_date: Period bounds (YYYY-MM-DD) for P&L-style reports\n"
-        "  contact_id: For aged-receivables/payables-by-contact"
+        "  date: Report date (YYYY-MM-DD); defaults to today\n"
+        "  periods: Number of comparison periods (e.g., 3 to compare to last 3)\n"
+        "  timeframe: MONTH | QUARTER | YEAR — how comparison periods are spaced\n"
+        "  payments_only: True to include only accounts with payments\n"
+        "  standard_layout: True for Xero's standard layout instead of custom\n"
+        "  tracking_option_id_1 / tracking_option_id_2: Filter by tracking option(s)"
     )
 )
-async def reports_run(
+async def reports_balance_sheet(
     profile: str | None = None,
-    report: str | None = None,
     date: str | None = None,
+    periods: int | None = None,
+    timeframe: str | None = None,
+    payments_only: bool = False,
+    standard_layout: bool = False,
+    tracking_option_id_1: str | None = None,
+    tracking_option_id_2: str | None = None,
+) -> str:
+    args = ["reports", "balance-sheet"]
+    if date: args.extend(["--date", date])
+    if periods: args.extend(["--periods", str(periods)])
+    if timeframe: args.extend(["--timeframe", timeframe])
+    if payments_only: args.append("--payments-only")
+    if standard_layout: args.append("--standard-layout")
+    if tracking_option_id_1: args.extend(["--tracking-option-id-1", tracking_option_id_1])
+    if tracking_option_id_2: args.extend(["--tracking-option-id-2", tracking_option_id_2])
+    return json.dumps(await _xero(args, profile=profile), indent=2)
+
+
+@mcp.tool(
+    description=(
+        "Generate a Profit & Loss report (income statement) for a date range.\n"
+        "Args:\n"
+        "  profile: Xero profile name\n"
+        "  from_date: Period start (YYYY-MM-DD)\n"
+        "  to_date: Period end (YYYY-MM-DD)\n"
+        "  periods: Number of comparison periods\n"
+        "  timeframe: MONTH | QUARTER | YEAR — comparison period spacing\n"
+        "  payments_only: True to include only accounts with payments\n"
+        "  standard_layout: True for Xero's standard layout"
+    )
+)
+async def reports_profit_and_loss(
+    profile: str | None = None,
     from_date: str | None = None,
     to_date: str | None = None,
-    contact_id: str | None = None,
+    periods: int | None = None,
+    timeframe: str | None = None,
+    payments_only: bool = False,
+    standard_layout: bool = False,
 ) -> str:
-    if not report:
-        return json.dumps({"_error": "must provide a `report` name"})
-    args = ["reports", report.lower()]
-    if date:
-        args.extend(["--date", date])
-    if from_date:
-        args.extend(["--from-date", from_date])
-    if to_date:
-        args.extend(["--to-date", to_date])
-    if contact_id:
-        args.extend(["--contact-id", contact_id])
+    args = ["reports", "profit-and-loss"]
+    if from_date: args.extend(["--from", from_date])
+    if to_date: args.extend(["--to", to_date])
+    if periods: args.extend(["--periods", str(periods)])
+    if timeframe: args.extend(["--timeframe", timeframe])
+    if payments_only: args.append("--payments-only")
+    if standard_layout: args.append("--standard-layout")
     return json.dumps(await _xero(args, profile=profile), indent=2)
+
+
+@mcp.tool(
+    description=(
+        "Generate a Trial Balance report — every account's debit/credit balance "
+        "as of a given date.\n"
+        "Args:\n"
+        "  profile: Xero profile name\n"
+        "  date: Report date (YYYY-MM-DD); defaults to today\n"
+        "  payments_only: True to include only accounts with payments"
+    )
+)
+async def reports_trial_balance(
+    profile: str | None = None,
+    date: str | None = None,
+    payments_only: bool = False,
+) -> str:
+    args = ["reports", "trial-balance"]
+    if date: args.extend(["--date", date])
+    if payments_only: args.append("--payments-only")
+    return json.dumps(await _xero(args, profile=profile), indent=2)
+
+
+@mcp.tool(
+    description=(
+        "Generate an Aged Receivables report for a specific contact — invoices "
+        "this contact owes you, bucketed by age.\n"
+        "Args:\n"
+        "  profile: Xero profile name\n"
+        "  contact_id: Xero ContactID (REQUIRED)\n"
+        "  report_date: Date the report is run as of (YYYY-MM-DD)\n"
+        "  from_date / to_date: Filter to invoices in this date range"
+    )
+)
+async def reports_aged_receivables(
+    profile: str | None = None,
+    contact_id: str | None = None,
+    report_date: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> str:
+    if not contact_id:
+        return json.dumps({"_error": "contact_id is required for aged-receivables"})
+    args = ["reports", "aged-receivables", "--contact-id", contact_id]
+    if report_date: args.extend(["--report-date", report_date])
+    if from_date: args.extend(["--from-date", from_date])
+    if to_date: args.extend(["--to-date", to_date])
+    return json.dumps(await _xero(args, profile=profile), indent=2)
+
+
+@mcp.tool(
+    description=(
+        "Generate an Aged Payables report for a specific contact — bills you "
+        "owe this contact, bucketed by age.\n"
+        "Args:\n"
+        "  profile: Xero profile name\n"
+        "  contact_id: Xero ContactID (REQUIRED)\n"
+        "  report_date: Date the report is run as of (YYYY-MM-DD)\n"
+        "  from_date / to_date: Filter to bills in this date range"
+    )
+)
+async def reports_aged_payables(
+    profile: str | None = None,
+    contact_id: str | None = None,
+    report_date: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> str:
+    if not contact_id:
+        return json.dumps({"_error": "contact_id is required for aged-payables"})
+    args = ["reports", "aged-payables", "--contact-id", contact_id]
+    if report_date: args.extend(["--report-date", report_date])
+    if from_date: args.extend(["--from-date", from_date])
+    if to_date: args.extend(["--to-date", to_date])
+    return json.dumps(await _xero(args, profile=profile), indent=2)
+
+
+# ---------------------------------------------------------------------------
+# Contact groups, credit notes, manual journals, tax rates, currencies,
+# tracking, and the create/update variants of items / payments / bank
+# transactions / quotes / accounts. All shells out to the same `xero <group>
+# <action> --json` pattern; complex create/update payloads go via _file_action.
+# ---------------------------------------------------------------------------
+
+@mcp.tool(description="List contact groups (Xero's way of bucketing contacts for batch ops).")
+async def contact_groups_list(profile: str | None = None) -> str:
+    return json.dumps(await _xero(["contact-groups", "list"], profile=profile), indent=2)
+
+
+@mcp.tool(description="List credit notes (refunds / overpayments owed back to customers or by you to suppliers).")
+async def credit_notes_list(profile: str | None = None, page: int | None = None) -> str:
+    args = ["credit-notes", "list"]
+    if page: args.extend(["--page", str(page)])
+    return json.dumps(await _xero(args, profile=profile), indent=2)
+
+
+@mcp.tool(description="Create a credit note. Pass `data` matching Xero's CreateCreditNote schema (must include line items).")
+async def credit_notes_create(profile: str | None = None, data: dict | None = None) -> str:
+    if not data:
+        return json.dumps({"_error": "must provide `data` containing the credit-note payload"})
+    return json.dumps(await _file_action(["credit-notes", "create"], data, profile=profile), indent=2)
+
+
+@mcp.tool(description="Update a draft credit note. Pass full update payload as `data`, must include CreditNoteID.")
+async def credit_notes_update(profile: str | None = None, data: dict | None = None) -> str:
+    if not data:
+        return json.dumps({"_error": "must provide `data` containing the update payload"})
+    return json.dumps(await _file_action(["credit-notes", "update"], data, profile=profile), indent=2)
+
+
+@mcp.tool(description="List manual journals. Optional `modified_after` (YYYY-MM-DD) and pagination.")
+async def manual_journals_list(profile: str | None = None, modified_after: str | None = None, page: int | None = None) -> str:
+    args = ["manual-journals", "list"]
+    if modified_after: args.extend(["--modified-after", modified_after])
+    if page: args.extend(["--page", str(page)])
+    return json.dumps(await _xero(args, profile=profile), indent=2)
+
+
+@mcp.tool(description="Create a manual journal. Pass `data` with narration + at least 2 balanced journal lines.")
+async def manual_journals_create(profile: str | None = None, data: dict | None = None) -> str:
+    if not data:
+        return json.dumps({"_error": "must provide `data` containing narration + manualJournalLines"})
+    return json.dumps(await _file_action(["manual-journals", "create"], data, profile=profile), indent=2)
+
+
+@mcp.tool(description="Update a draft manual journal. Pass `data` with the full update payload including ManualJournalID.")
+async def manual_journals_update(profile: str | None = None, data: dict | None = None) -> str:
+    if not data:
+        return json.dumps({"_error": "must provide `data` containing the update payload"})
+    return json.dumps(await _file_action(["manual-journals", "update"], data, profile=profile), indent=2)
+
+
+@mcp.tool(description="List tax rates configured in Xero (GST, HST, no-tax, etc.).")
+async def tax_rates_list(profile: str | None = None) -> str:
+    return json.dumps(await _xero(["tax-rates", "list"], profile=profile), indent=2)
+
+
+@mcp.tool(description="List currencies enabled in this Xero org.")
+async def currencies_list(profile: str | None = None) -> str:
+    return json.dumps(await _xero(["currencies", "list"], profile=profile), indent=2)
+
+
+@mcp.tool(description="List tracking categories (Xero's way of tagging transactions for departmental/regional reporting).")
+async def tracking_categories_list(profile: str | None = None) -> str:
+    return json.dumps(await _xero(["tracking", "categories", "list"], profile=profile), indent=2)
+
+
+@mcp.tool(
+    description=(
+        "List tracking options for a specific tracking category.\n"
+        "Args:\n"
+        "  profile: Xero profile name\n"
+        "  tracking_category_id: TrackingCategoryID (REQUIRED)"
+    )
+)
+async def tracking_options_list(profile: str | None = None, tracking_category_id: str | None = None) -> str:
+    if not tracking_category_id:
+        return json.dumps({"_error": "tracking_category_id is required"})
+    return json.dumps(
+        await _xero(["tracking", "options", "list", "--tracking-category-id", tracking_category_id], profile=profile),
+        indent=2,
+    )
+
+
+@mcp.tool(
+    description=(
+        "Record a payment against an existing invoice.\n"
+        "Args:\n"
+        "  profile: Xero profile name\n"
+        "  invoice_id: Xero InvoiceID (REQUIRED)\n"
+        "  account_id: Bank/clearing account ID the payment is FROM (REQUIRED)\n"
+        "  amount: Payment amount, positive number (REQUIRED)\n"
+        "  date: Payment date (YYYY-MM-DD); defaults to today\n"
+        "  reference: Optional reference text shown on the payment"
+    )
+)
+async def payments_create(
+    profile: str | None = None,
+    invoice_id: str | None = None,
+    account_id: str | None = None,
+    amount: float | None = None,
+    date: str | None = None,
+    reference: str | None = None,
+) -> str:
+    missing = [k for k, v in (("invoice_id", invoice_id), ("account_id", account_id), ("amount", amount)) if not v]
+    if missing:
+        return json.dumps({"_error": f"required args missing: {missing}"})
+    args = ["payments", "create", "--invoice-id", invoice_id, "--account-id", account_id, "--amount", str(amount)]
+    if date: args.extend(["--date", date])
+    if reference: args.extend(["--reference", reference])
+    return json.dumps(await _xero(args, profile=profile), indent=2)
+
+
+@mcp.tool(description="Create an inventory item / product. Pass `data` matching Xero's CreateItem schema (code + name minimum).")
+async def items_create(profile: str | None = None, data: dict | None = None) -> str:
+    if not data:
+        return json.dumps({"_error": "must provide `data` with at least Code and Name"})
+    return json.dumps(await _file_action(["items", "create"], data, profile=profile), indent=2)
+
+
+@mcp.tool(description="Update an inventory item. Pass `data` with ItemID + fields to update.")
+async def items_update(profile: str | None = None, data: dict | None = None) -> str:
+    if not data:
+        return json.dumps({"_error": "must provide `data` containing the update payload"})
+    return json.dumps(await _file_action(["items", "update"], data, profile=profile), indent=2)
+
+
+@mcp.tool(
+    description=(
+        "Create a bank transaction (Spend Money or Receive Money against a bank account).\n"
+        "Pass `data` matching Xero's CreateBankTransaction schema (Type, BankAccount, Contact, LineItems).\n"
+        "Type values: SPEND, RECEIVE, SPEND-TRANSFER, RECEIVE-TRANSFER, SPEND-PREPAYMENT, "
+        "RECEIVE-PREPAYMENT, SPEND-OVERPAYMENT, RECEIVE-OVERPAYMENT."
+    )
+)
+async def bank_transactions_create(profile: str | None = None, data: dict | None = None) -> str:
+    if not data:
+        return json.dumps({"_error": "must provide `data` containing the bank-transaction payload"})
+    return json.dumps(await _file_action(["bank-transactions", "create"], data, profile=profile), indent=2)
+
+
+@mcp.tool(description="Update a bank transaction. Pass `data` with BankTransactionID and the fields to update.")
+async def bank_transactions_update(profile: str | None = None, data: dict | None = None) -> str:
+    if not data:
+        return json.dumps({"_error": "must provide `data` containing the update payload"})
+    return json.dumps(await _file_action(["bank-transactions", "update"], data, profile=profile), indent=2)
+
+
+@mcp.tool(description="Create a quote (proposal). Pass `data` matching Xero's CreateQuote schema (Contact + LineItems).")
+async def quotes_create(profile: str | None = None, data: dict | None = None) -> str:
+    if not data:
+        return json.dumps({"_error": "must provide `data` containing the quote payload"})
+    return json.dumps(await _file_action(["quotes", "create"], data, profile=profile), indent=2)
+
+
+@mcp.tool(description="Update a draft quote. Pass `data` with QuoteID and fields to update.")
+async def quotes_update(profile: str | None = None, data: dict | None = None) -> str:
+    if not data:
+        return json.dumps({"_error": "must provide `data` containing the update payload"})
+    return json.dumps(await _file_action(["quotes", "update"], data, profile=profile), indent=2)
+
+
+@mcp.tool(description="Update an account in the chart of accounts. Pass `data` with AccountID and fields to update.")
+async def accounts_update(profile: str | None = None, data: dict | None = None) -> str:
+    if not data:
+        return json.dumps({"_error": "must provide `data` containing the update payload"})
+    return json.dumps(await _file_action(["accounts", "update"], data, profile=profile), indent=2)
 
 
 # ---------------------------------------------------------------------------

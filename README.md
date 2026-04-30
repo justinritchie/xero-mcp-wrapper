@@ -42,26 +42,49 @@ Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 Then ⌘Q + reopen Claude Desktop.
 
-## Tools
+## Tools (37 total)
 
-Every tool that talks to the Xero API accepts an optional `profile: str` argument. If omitted, the CLI's default profile is used. To target a specific Xero organisation, pass e.g. `profile="ets"` or `profile="jumbo"`.
+Every tool accepts an optional `profile: str` argument. If omitted, the CLI's default profile is used. To target a specific Xero organisation, pass e.g. `profile="ets"` or `profile="jumbo"`.
 
-| Tool | What |
-|---|---|
-| `org_details` | Get the active organisation's details (currency, tax setup, etc.) |
-| `profiles_list` | List configured local profiles (no API call) |
-| `contacts_list` | List contacts, optional `search` and `page` filters |
-| `contacts_create` | Create a contact — inline `name`/`email`/`phone` or full `data` dict |
-| `contacts_update` | Update a contact — `contact_id` + inline fields, or full `data` dict |
-| `accounts_list` | List the chart of accounts |
-| `invoices_list` | List invoices, optional `status` / `contact_id` / `page` |
-| `invoices_create` | Create an invoice — `data` dict required (line items) |
-| `invoices_update` | Update an invoice — `data` dict required |
-| `quotes_list` | List quotes / proposals |
-| `payments_list` | List payments |
-| `items_list` | List inventory items |
-| `bank_transactions_list` | List bank transactions |
-| `reports_run` | Run a financial report (BalanceSheet, ProfitAndLoss, TrialBalance, AgedReceivables, etc.) |
+**Org & profiles**
+- `org_details` — active organisation's details (currency, tax setup, etc.)
+- `profiles_list` — configured local profiles (no API call)
+
+**Contacts**
+- `contacts_list` (search, page) · `contacts_create` (inline or `data`) · `contacts_update` (inline or `data`)
+- `contact_groups_list`
+
+**Accounts** (chart of accounts)
+- `accounts_list` · `accounts_update` (data)
+
+**Invoices · Credit Notes · Manual Journals · Bank Transactions** (full CRUD)
+- `invoices_list` / `invoices_create` / `invoices_update`
+- `credit_notes_list` / `credit_notes_create` / `credit_notes_update`
+- `manual_journals_list` (modified_after, page) / `manual_journals_create` / `manual_journals_update`
+- `bank_transactions_list` (page) / `bank_transactions_create` / `bank_transactions_update`
+
+**Items**
+- `items_list` · `items_create` · `items_update`
+
+**Quotes**
+- `quotes_list` · `quotes_create` · `quotes_update`
+
+**Payments**
+- `payments_list` · `payments_create` (inline: invoice_id, account_id, amount, date, reference)
+
+**Reference data**
+- `tax_rates_list` · `currencies_list` · `tracking_categories_list` · `tracking_options_list` (tracking_category_id)
+
+**Reports** — each with the right param schema
+- `reports_balance_sheet` (date, periods, timeframe, payments_only, standard_layout, tracking_option_id_1/2)
+- `reports_profit_and_loss` (from_date, to_date, periods, timeframe, payments_only, standard_layout)
+- `reports_trial_balance` (date, payments_only)
+- `reports_aged_receivables` (contact_id required, report_date, from_date, to_date)
+- `reports_aged_payables` (contact_id required, report_date, from_date, to_date)
+
+## Why this matters for Canadian Xero orgs
+
+The official `@xeroapi/xero-mcp-server` package only authenticates via Xero "Custom Connections" — and **custom connections are a US-only feature**. Canadian (and many other non-US) orgs literally cannot authenticate that way. The CLI's PKCE OAuth works for any Xero org regardless of region, which makes this wrapper the only viable MCP path for Canadian organisations like ETS.
 
 ## Multi-organisation usage
 
