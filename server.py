@@ -32,9 +32,46 @@ import json
 import os
 import shutil
 import tempfile
-from typing import Any
+from typing import Annotated, Any, Optional
 
 from fastmcp import FastMCP
+from pydantic import BeforeValidator
+
+
+# ─── JsonDict — accept dict OR JSON string for `data` parameters ────────────
+#
+# Background: FastMCP generates JSON Schema from function signatures. When a
+# param is typed `dict | None = None` (Python 3.10+ union syntax), some
+# clients respect the schema and send objects, others (Cowork harness, some
+# Codex builds) send the literal string. Pydantic then rejects with
+# `type=dict_type, input_type=str`.
+#
+# Fix: a `BeforeValidator` that coerces JSON-encoded strings to dicts and
+# passes through dicts/None unchanged. Apply this alias to every tool's
+# `data` parameter so the wrapper is tolerant of either client behavior.
+
+def _coerce_json_dict(value):
+    """Accept dict | JSON-encoded string; pass through None."""
+    if value is None or isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"`data` was a string but not valid JSON: {e}"
+            ) from e
+        if not isinstance(parsed, dict):
+            raise ValueError(
+                f"`data` parsed to {type(parsed).__name__}, expected JSON object"
+            )
+        return parsed
+    raise ValueError(
+        f"`data` must be a dict (or JSON string of one), got {type(value).__name__}"
+    )
+
+
+JsonDict = Annotated[Optional[dict], BeforeValidator(_coerce_json_dict)]
 
 
 XERO_BIN = os.environ.get("XERO_BIN") or shutil.which("xero") or "/opt/homebrew/bin/xero"
@@ -164,7 +201,7 @@ async def contacts_create(
     name: str | None = None,
     email: str | None = None,
     phone: str | None = None,
-    data: dict | None = None,
+    data: JsonDict = None,
 ) -> str:
     if data:
         return json.dumps(await _file_action(["contacts", "create"], data, profile=profile), indent=2)
@@ -196,7 +233,7 @@ async def contacts_update(
     name: str | None = None,
     email: str | None = None,
     phone: str | None = None,
-    data: dict | None = None,
+    data: JsonDict = None,
 ) -> str:
     if data:
         return json.dumps(await _file_action(["contacts", "update"], data, profile=profile), indent=2)
@@ -216,9 +253,58 @@ async def contacts_update(
 # Accounts / chart of accounts
 # ---------------------------------------------------------------------------
 
-@mcp.tool(description="List all accounts in the Chart of Accounts. Returns code, name, type, and tax type for each.")
-async def accounts_list(profile: str | None = None) -> str:
-    return json.dumps(await _xero(["accounts", "list"], profile=profile), indent=2)
+@mcp.tool(
+    description=(
+        "List accounts in the Chart of Accounts with optional filters.\n"
+        "\n"
+        "Without filters, returns the FULL chart of accounts which can be "
+        "large (~80KB on a typical Xero org with hundreds of accounts) and "
+        "may overflow the MCP tool-result token cap. Use the filter args to "
+        "scope the result to what you actually need — e.g. just the BANK "
+        "accounts during a payout reconciliation, or accounts whose code "
+        "starts with '4' for revenue accounts.\n"
+        "\n"
+        "Args:\n"
+        "  profile: Xero profile name (e.g. 'ets', 'xe', 'jumbo')\n"
+        "  type: filter by AccountType — common values: BANK, CURRENT, "
+        "FIXED, EQUITY, REVENUE, EXPENSE, DIRECTCOSTS, OVERHEADS, "
+        "OTHERINCOME, LIABILITY, CURRLIAB, etc.\n"
+        "  code: filter by account code prefix (substring match, "
+        "case-insensitive). E.g. '4' for revenue, '6' for expenses.\n"
+        "  name_contains: case-insensitive substring filter on account name\n"
+        "\n"
+        "Filters are applied wrapper-side after fetching — the underlying "
+        "CLI doesn't accept where-clauses for accounts."
+    ),
+)
+async def accounts_list(
+    profile: str | None = None,
+    type: str | None = None,
+    code: str | None = None,
+    name_contains: str | None = None,
+) -> str:
+    accts = await _xero(["accounts", "list"], profile=profile)
+    if not isinstance(accts, list):
+        # Error string from _xero
+        return json.dumps(accts, indent=2)
+
+    filtered = accts
+    if type:
+        type_u = type.upper()
+        filtered = [a for a in filtered if (a.get("type") or "").upper() == type_u]
+    if code:
+        code_l = code.lower()
+        filtered = [a for a in filtered if code_l in (a.get("code") or "").lower()]
+    if name_contains:
+        nc = name_contains.lower()
+        filtered = [a for a in filtered if nc in (a.get("name") or "").lower()]
+
+    return json.dumps({
+        "count": len(filtered),
+        "total_unfiltered": len(accts),
+        "filters": {"type": type, "code": code, "name_contains": name_contains},
+        "accounts": filtered,
+    }, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -227,12 +313,20 @@ async def accounts_list(profile: str | None = None) -> str:
 
 @mcp.tool(
     description=(
-        "List invoices. Optionally filter by status or contact, paginate.\n"
+        "List invoices. Optionally filter by contact, paginate, then "
+        "wrapper-side filter by status.\n"
+        "\n"
         "Args:\n"
         "  profile: Xero profile name\n"
-        "  status: Filter by invoice status (DRAFT, SUBMITTED, AUTHORISED, PAID, VOIDED, DELETED)\n"
-        "  contact_id: Filter by ContactID\n"
-        "  page: 1-based page index"
+        "  status: Filter by invoice status — DRAFT | SUBMITTED | AUTHORISED "
+        "| PAID | VOIDED | DELETED. Applied WRAPPER-SIDE after fetching "
+        "(the underlying CLI doesn't accept --status).\n"
+        "  contact_id: Filter by ContactID (CLI-side, fast)\n"
+        "  page: 1-based page index (CLI-side, ~100 invoices per page)\n"
+        "\n"
+        "Note: because status filter is wrapper-side, results may be smaller "
+        "than the page count suggests. To find all PAID invoices on a busy "
+        "org, you may need to walk multiple pages."
     )
 )
 async def invoices_list(
@@ -242,13 +336,19 @@ async def invoices_list(
     page: int | None = None,
 ) -> str:
     args = ["invoices", "list"]
-    if status:
-        args.extend(["--status", status])
+    # NOTE: --status is NOT a valid CLI flag (verified 2026-05-15). Filter
+    # wrapper-side instead. The CLI does support --contact-id and --page.
     if contact_id:
         args.extend(["--contact-id", contact_id])
     if page:
         args.extend(["--page", str(page)])
-    return json.dumps(await _xero(args, profile=profile), indent=2)
+    invs = await _xero(args, profile=profile)
+    if not isinstance(invs, list):
+        return json.dumps(invs, indent=2)
+    if status:
+        status_u = status.upper()
+        invs = [i for i in invs if (i.get("status") or "").upper() == status_u]
+    return json.dumps(invs, indent=2)
 
 
 @mcp.tool(
@@ -257,7 +357,7 @@ async def invoices_list(
         "schema) — invoices have line items so the inline-flag form is impractical."
     )
 )
-async def invoices_create(profile: str | None = None, data: dict | None = None) -> str:
+async def invoices_create(profile: str | None = None, data: JsonDict = None) -> str:
     if not data:
         return json.dumps({"_error": "must provide `data` containing the invoice payload"})
     return json.dumps(await _file_action(["invoices", "create"], data, profile=profile), indent=2)
@@ -269,7 +369,7 @@ async def invoices_create(profile: str | None = None, data: dict | None = None) 
         "including the InvoiceID."
     )
 )
-async def invoices_update(profile: str | None = None, data: dict | None = None) -> str:
+async def invoices_update(profile: str | None = None, data: JsonDict = None) -> str:
     if not data:
         return json.dumps({"_error": "must provide `data` containing the update payload"})
     return json.dumps(await _file_action(["invoices", "update"], data, profile=profile), indent=2)
@@ -297,12 +397,39 @@ async def items_list(profile: str | None = None) -> str:
     return json.dumps(await _xero(["items", "list"], profile=profile), indent=2)
 
 
-@mcp.tool(description="List bank transactions (Spend/Receive money against bank accounts).")
-async def bank_transactions_list(profile: str | None = None, page: int | None = None) -> str:
+@mcp.tool(
+    description=(
+        "List bank transactions (Spend/Receive money against bank accounts).\n"
+        "\n"
+        "Sorted NEWEST-FIRST by date by default — useful for monthly close "
+        "where you want to see recent activity. The underlying CLI returns "
+        "oldest-first, so the wrapper sorts the response.\n"
+        "\n"
+        "Args:\n"
+        "  profile: Xero profile name\n"
+        "  page: 1-based page index (~100 transactions per page, CLI-side)\n"
+        "  sort: 'desc' (default, newest first) | 'asc' (oldest first — "
+        "matches raw CLI behavior)\n"
+        "\n"
+        "Returns the list of transactions, each with bankTransactionID, "
+        "type (RECEIVE/SPEND), date, contact, total, status, reference, "
+        "lineItems, etc."
+    ),
+)
+async def bank_transactions_list(
+    profile: str | None = None,
+    page: int | None = None,
+    sort: str = "desc",
+) -> str:
     args = ["bank-transactions", "list"]
     if page:
         args.extend(["--page", str(page)])
-    return json.dumps(await _xero(args, profile=profile), indent=2)
+    txs = await _xero(args, profile=profile)
+    if isinstance(txs, list) and sort == "desc":
+        # Sort by date descending (newest first). 'date' is YYYY-MM-DD strings,
+        # so lexicographic sort works correctly.
+        txs = sorted(txs, key=lambda t: t.get("date") or "", reverse=True)
+    return json.dumps(txs, indent=2)
 
 
 @mcp.tool(
@@ -467,14 +594,14 @@ async def credit_notes_list(profile: str | None = None, page: int | None = None)
 
 
 @mcp.tool(description="Create a credit note. Pass `data` matching Xero's CreateCreditNote schema (must include line items).")
-async def credit_notes_create(profile: str | None = None, data: dict | None = None) -> str:
+async def credit_notes_create(profile: str | None = None, data: JsonDict = None) -> str:
     if not data:
         return json.dumps({"_error": "must provide `data` containing the credit-note payload"})
     return json.dumps(await _file_action(["credit-notes", "create"], data, profile=profile), indent=2)
 
 
 @mcp.tool(description="Update a draft credit note. Pass full update payload as `data`, must include CreditNoteID.")
-async def credit_notes_update(profile: str | None = None, data: dict | None = None) -> str:
+async def credit_notes_update(profile: str | None = None, data: JsonDict = None) -> str:
     if not data:
         return json.dumps({"_error": "must provide `data` containing the update payload"})
     return json.dumps(await _file_action(["credit-notes", "update"], data, profile=profile), indent=2)
@@ -489,14 +616,14 @@ async def manual_journals_list(profile: str | None = None, modified_after: str |
 
 
 @mcp.tool(description="Create a manual journal. Pass `data` with narration + at least 2 balanced journal lines.")
-async def manual_journals_create(profile: str | None = None, data: dict | None = None) -> str:
+async def manual_journals_create(profile: str | None = None, data: JsonDict = None) -> str:
     if not data:
         return json.dumps({"_error": "must provide `data` containing narration + manualJournalLines"})
     return json.dumps(await _file_action(["manual-journals", "create"], data, profile=profile), indent=2)
 
 
 @mcp.tool(description="Update a draft manual journal. Pass `data` with the full update payload including ManualJournalID.")
-async def manual_journals_update(profile: str | None = None, data: dict | None = None) -> str:
+async def manual_journals_update(profile: str | None = None, data: JsonDict = None) -> str:
     if not data:
         return json.dumps({"_error": "must provide `data` containing the update payload"})
     return json.dumps(await _file_action(["manual-journals", "update"], data, profile=profile), indent=2)
@@ -564,14 +691,14 @@ async def payments_create(
 
 
 @mcp.tool(description="Create an inventory item / product. Pass `data` matching Xero's CreateItem schema (code + name minimum).")
-async def items_create(profile: str | None = None, data: dict | None = None) -> str:
+async def items_create(profile: str | None = None, data: JsonDict = None) -> str:
     if not data:
         return json.dumps({"_error": "must provide `data` with at least Code and Name"})
     return json.dumps(await _file_action(["items", "create"], data, profile=profile), indent=2)
 
 
 @mcp.tool(description="Update an inventory item. Pass `data` with ItemID + fields to update.")
-async def items_update(profile: str | None = None, data: dict | None = None) -> str:
+async def items_update(profile: str | None = None, data: JsonDict = None) -> str:
     if not data:
         return json.dumps({"_error": "must provide `data` containing the update payload"})
     return json.dumps(await _file_action(["items", "update"], data, profile=profile), indent=2)
@@ -585,35 +712,35 @@ async def items_update(profile: str | None = None, data: dict | None = None) -> 
         "RECEIVE-PREPAYMENT, SPEND-OVERPAYMENT, RECEIVE-OVERPAYMENT."
     )
 )
-async def bank_transactions_create(profile: str | None = None, data: dict | None = None) -> str:
+async def bank_transactions_create(profile: str | None = None, data: JsonDict = None) -> str:
     if not data:
         return json.dumps({"_error": "must provide `data` containing the bank-transaction payload"})
     return json.dumps(await _file_action(["bank-transactions", "create"], data, profile=profile), indent=2)
 
 
 @mcp.tool(description="Update a bank transaction. Pass `data` with BankTransactionID and the fields to update.")
-async def bank_transactions_update(profile: str | None = None, data: dict | None = None) -> str:
+async def bank_transactions_update(profile: str | None = None, data: JsonDict = None) -> str:
     if not data:
         return json.dumps({"_error": "must provide `data` containing the update payload"})
     return json.dumps(await _file_action(["bank-transactions", "update"], data, profile=profile), indent=2)
 
 
 @mcp.tool(description="Create a quote (proposal). Pass `data` matching Xero's CreateQuote schema (Contact + LineItems).")
-async def quotes_create(profile: str | None = None, data: dict | None = None) -> str:
+async def quotes_create(profile: str | None = None, data: JsonDict = None) -> str:
     if not data:
         return json.dumps({"_error": "must provide `data` containing the quote payload"})
     return json.dumps(await _file_action(["quotes", "create"], data, profile=profile), indent=2)
 
 
 @mcp.tool(description="Update a draft quote. Pass `data` with QuoteID and fields to update.")
-async def quotes_update(profile: str | None = None, data: dict | None = None) -> str:
+async def quotes_update(profile: str | None = None, data: JsonDict = None) -> str:
     if not data:
         return json.dumps({"_error": "must provide `data` containing the update payload"})
     return json.dumps(await _file_action(["quotes", "update"], data, profile=profile), indent=2)
 
 
 @mcp.tool(description="Update an account in the chart of accounts. Pass `data` with AccountID and fields to update.")
-async def accounts_update(profile: str | None = None, data: dict | None = None) -> str:
+async def accounts_update(profile: str | None = None, data: JsonDict = None) -> str:
     if not data:
         return json.dumps({"_error": "must provide `data` containing the update payload"})
     return json.dumps(await _file_action(["accounts", "update"], data, profile=profile), indent=2)
