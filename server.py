@@ -117,6 +117,59 @@ async def _xero(args: list[str], profile: str | None = None, stdin_data: str | N
         return {"_raw_output": stdout_b.decode("utf-8", errors="replace")[:5000]}
 
 
+async def _find_last_page(
+    base_args: list[str],
+    profile: str | None = None,
+    page_flag: str = "--page",
+    max_probes: int = 20,
+) -> int:
+    """Binary-search for the last non-empty page of a paginated list endpoint.
+
+    The xero CLI returns OLDEST data first when paginating forward (page 1 =
+    earliest). Recent data lives on the LAST page. To get "last month" we
+    need to find the highest page number that still returns rows, then walk
+    BACKWARD from there.
+
+    Algorithm:
+      Phase 1 (doubling): probe pages 2, 4, 8, 16, ... until we get an empty
+        page. The last non-empty becomes the lower bound; the empty page is
+        the upper bound. Caps at 2^max_probes (well past any realistic org).
+      Phase 2 (binary): standard bisect between [lo+1, hi-1] for the exact
+        last non-empty page.
+
+    Worst case ~13 CLI calls for an org with 100 pages of history.
+
+    Returns the last non-empty page number, or 1 if even page 1 is empty.
+    """
+    # Phase 1: doubling search for an empty page
+    lo = 1
+    hi = 2
+    last_nonempty = 1
+    for _ in range(max_probes):
+        txs = await _xero(base_args + [page_flag, str(hi)], profile=profile)
+        if not isinstance(txs, list) or len(txs) == 0:
+            break
+        last_nonempty = hi
+        lo = hi
+        hi *= 2
+    else:
+        # Hit the probe cap without finding an empty page — caller's data
+        # is unreasonably large. Return what we know.
+        return last_nonempty
+
+    # Phase 2: binary search between last known non-empty (lo) and first
+    # known empty (hi). Invariant: lo is non-empty, hi is empty.
+    while lo < hi - 1:
+        mid = (lo + hi) // 2
+        txs = await _xero(base_args + [page_flag, str(mid)], profile=profile)
+        if isinstance(txs, list) and len(txs) > 0:
+            lo = mid
+            last_nonempty = mid
+        else:
+            hi = mid
+    return last_nonempty
+
+
 # ---------------------------------------------------------------------------
 # Org / profile / auth — read-only inspection
 # ---------------------------------------------------------------------------
@@ -269,9 +322,13 @@ async def contacts_update(
         "  type: filter by AccountType — common values: BANK, CURRENT, "
         "FIXED, EQUITY, REVENUE, EXPENSE, DIRECTCOSTS, OVERHEADS, "
         "OTHERINCOME, LIABILITY, CURRLIAB, etc.\n"
-        "  code: filter by account code prefix (substring match, "
-        "case-insensitive). E.g. '4' for revenue, '6' for expenses.\n"
+        "  code: substring match on account code (case-insensitive). E.g. "
+        "'40' matches '4000', '1040', etc.\n"
+        "  code_prefix: exact prefix match on account code — E.g. '4' for "
+        "all 4xxx codes, '44' for ETS revenue accounts.\n"
         "  name_contains: case-insensitive substring filter on account name\n"
+        "  status: filter by account status — defaults to 'ACTIVE'. Set to "
+        "None or '' to include ARCHIVED accounts.\n"
         "\n"
         "Filters are applied wrapper-side after fetching — the underlying "
         "CLI doesn't accept where-clauses for accounts."
@@ -281,7 +338,9 @@ async def accounts_list(
     profile: str | None = None,
     type: str | None = None,
     code: str | None = None,
+    code_prefix: str | None = None,
     name_contains: str | None = None,
+    status: str | None = "ACTIVE",
 ) -> str:
     accts = await _xero(["accounts", "list"], profile=profile)
     if not isinstance(accts, list):
@@ -295,14 +354,27 @@ async def accounts_list(
     if code:
         code_l = code.lower()
         filtered = [a for a in filtered if code_l in (a.get("code") or "").lower()]
+    if code_prefix:
+        cp = code_prefix.lower()
+        filtered = [a for a in filtered if (a.get("code") or "").lower().startswith(cp)]
     if name_contains:
         nc = name_contains.lower()
         filtered = [a for a in filtered if nc in (a.get("name") or "").lower()]
+    if status:
+        # Pass status=None or "" to opt out of the ACTIVE-only default.
+        status_u = status.upper()
+        filtered = [a for a in filtered if (a.get("status") or "").upper() == status_u]
 
     return json.dumps({
         "count": len(filtered),
         "total_unfiltered": len(accts),
-        "filters": {"type": type, "code": code, "name_contains": name_contains},
+        "filters": {
+            "type": type,
+            "code": code,
+            "code_prefix": code_prefix,
+            "name_contains": name_contains,
+            "status": status,
+        },
         "accounts": filtered,
     }, indent=2)
 
@@ -313,42 +385,82 @@ async def accounts_list(
 
 @mcp.tool(
     description=(
-        "List invoices. Optionally filter by contact, paginate, then "
-        "wrapper-side filter by status.\n"
+        "List invoices with optional contact / status / date filters.\n"
+        "\n"
+        "USE WHENEVER you want a slice of the invoice ledger — open bills, "
+        "paid invoices for a contact, last month's billing, etc.\n"
+        "\n"
+        "The xero CLI supports `--contact-id`, `--invoice-number`, `--page`, "
+        "and `--page-size` server-side. `--status` is NOT a valid CLI flag, "
+        "so status filtering happens wrapper-side after fetch. Date filters "
+        "also happen wrapper-side.\n"
+        "\n"
+        "IMPORTANT: the CLI's default --page-size is just 10. This wrapper "
+        "defaults to 100 so a single call returns a useful slice. Bump "
+        "page_size higher (max ~1000 per Xero API) for bigger pulls.\n"
         "\n"
         "Args:\n"
         "  profile: Xero profile name\n"
-        "  status: Filter by invoice status — DRAFT | SUBMITTED | AUTHORISED "
-        "| PAID | VOIDED | DELETED. Applied WRAPPER-SIDE after fetching "
-        "(the underlying CLI doesn't accept --status).\n"
-        "  contact_id: Filter by ContactID (CLI-side, fast)\n"
-        "  page: 1-based page index (CLI-side, ~100 invoices per page)\n"
+        "  status: DRAFT | SUBMITTED | AUTHORISED | PAID | VOIDED | DELETED "
+        "(wrapper-side filter)\n"
+        "  contact_id: ContactID (CLI-side, fast)\n"
+        "  invoice_number: Invoice number (CLI-side, fast — exact match)\n"
+        "  page: 1-based page index\n"
+        "  page_size: Items per page (default 100; CLI default is 10)\n"
+        "  from_date: YYYY-MM-DD inclusive (wrapper-side on invoice `date`)\n"
+        "  to_date: YYYY-MM-DD inclusive (wrapper-side on invoice `date`)\n"
         "\n"
-        "Note: because status filter is wrapper-side, results may be smaller "
-        "than the page count suggests. To find all PAID invoices on a busy "
-        "org, you may need to walk multiple pages."
+        "Returns either a raw list (no filters applied wrapper-side) or a "
+        "metadata envelope with count + filters_applied + invoices when any "
+        "wrapper-side filter is in use."
     )
 )
 async def invoices_list(
     profile: str | None = None,
     status: str | None = None,
     contact_id: str | None = None,
+    invoice_number: str | None = None,
     page: int | None = None,
+    page_size: int = 100,
+    from_date: str | None = None,
+    to_date: str | None = None,
 ) -> str:
-    args = ["invoices", "list"]
-    # NOTE: --status is NOT a valid CLI flag (verified 2026-05-15). Filter
-    # wrapper-side instead. The CLI does support --contact-id and --page.
+    args = ["invoices", "list", "--page-size", str(page_size)]
     if contact_id:
         args.extend(["--contact-id", contact_id])
+    if invoice_number:
+        args.extend(["--invoice-number", invoice_number])
     if page:
         args.extend(["--page", str(page)])
     invs = await _xero(args, profile=profile)
     if not isinstance(invs, list):
         return json.dumps(invs, indent=2)
+
+    raw_count = len(invs)
+    applied: dict[str, Any] = {}
     if status:
         status_u = status.upper()
         invs = [i for i in invs if (i.get("status") or "").upper() == status_u]
-    return json.dumps(invs, indent=2)
+        applied["status"] = status
+    if from_date:
+        invs = [i for i in invs if (i.get("date") or "")[:10] >= from_date]
+        applied["from_date"] = from_date
+    if to_date:
+        invs = [i for i in invs if (i.get("date") or "")[:10] <= to_date]
+        applied["to_date"] = to_date
+
+    if not applied:
+        # No wrapper-side filtering — preserve legacy raw-list shape
+        return json.dumps(invs, indent=2)
+
+    return json.dumps({
+        "count": len(invs),
+        "raw_count_before_wrapper_filter": raw_count,
+        "page": page,
+        "page_size": page_size,
+        "filters_applied": applied,
+        "invoices": invs,
+    }, indent=2)
 
 
 @mcp.tool(
@@ -399,36 +511,142 @@ async def items_list(profile: str | None = None) -> str:
 
 @mcp.tool(
     description=(
-        "List bank transactions (Spend/Receive money against bank accounts).\n"
+        "List bank transactions (Spend/Receive money against bank accounts) "
+        "with optional date / contact / type / bank-account filters.\n"
         "\n"
-        "Sorted NEWEST-FIRST by date by default — useful for monthly close "
-        "where you want to see recent activity. The underlying CLI returns "
-        "oldest-first, so the wrapper sorts the response.\n"
+        "USE WHENEVER you want bank-transaction data for a specific period. "
+        "The Xero CLI itself only supports `--page`, `--bank-account-id`, and "
+        "`--bank-transaction-id` (no --where, no --from-date, no --status), so "
+        "this wrapper does the heavy lifting:\n"
+        "  - If from_date/to_date are supplied, the wrapper first BINARY-"
+        "SEARCHES for the last page (~10-14 CLI calls regardless of org age), "
+        "then walks BACKWARD applying date filters until it has covered the "
+        "requested window. For a monthly-close lookup on an org with 10 years "
+        "of history this is typically 1-3 page fetches after the page-count "
+        "discovery, instead of walking 80+ pages forward from page 1.\n"
+        "  - If only `page` is set, returns that single page (CLI-direct, "
+        "legacy behavior, oldest-first).\n"
+        "  - If nothing is set, returns just page 1 of the org's history "
+        "(usually the OLDEST 100 transactions; pass from_date for recents).\n"
         "\n"
         "Args:\n"
         "  profile: Xero profile name\n"
-        "  page: 1-based page index (~100 transactions per page, CLI-side)\n"
-        "  sort: 'desc' (default, newest first) | 'asc' (oldest first — "
-        "matches raw CLI behavior)\n"
+        "  page: 1-based page index — explicit single-page mode. Ignored if "
+        "from_date/to_date are set.\n"
+        "  sort: 'desc' (default, newest first) | 'asc' (oldest first)\n"
+        "  from_date: YYYY-MM-DD inclusive lower bound (wrapper-side filter)\n"
+        "  to_date: YYYY-MM-DD inclusive upper bound (wrapper-side filter)\n"
+        "  bank_account_id: BankAccount.AccountID filter (CLI-side, fast)\n"
+        "  type: 'RECEIVE' | 'SPEND' | 'RECEIVE-OVERPAYMENT' | 'SPEND-"
+        "OVERPAYMENT' | 'RECEIVE-PREPAYMENT' | 'SPEND-PREPAYMENT' / 'RECEIVE-"
+        "TRANSFER' / 'SPEND-TRANSFER' (wrapper-side)\n"
+        "  contact_id: Filter to transactions for a given Contact.ContactID "
+        "(wrapper-side; CLI does not support contact filter on bank-tx)\n"
+        "  max_pages: Safety cap on how many pages to fetch when auto-walking "
+        "backward (default 20 — at 100 tx/page = 2000 tx, plenty for any "
+        "month). Bump if you're asking for a year-plus range.\n"
         "\n"
-        "Returns the list of transactions, each with bankTransactionID, "
-        "type (RECEIVE/SPEND), date, contact, total, status, reference, "
-        "lineItems, etc."
+        "Returns a metadata envelope with `count`, `pages_walked`, "
+        "`last_page_discovered`, `filters_applied`, and `transactions` "
+        "(each with bankTransactionID, type, date, contact, total, status, "
+        "reference, lineItems, etc.)."
     ),
 )
 async def bank_transactions_list(
     profile: str | None = None,
     page: int | None = None,
     sort: str = "desc",
+    from_date: str | None = None,
+    to_date: str | None = None,
+    bank_account_id: str | None = None,
+    type: str | None = None,
+    contact_id: str | None = None,
+    max_pages: int = 20,
 ) -> str:
-    args = ["bank-transactions", "list"]
-    if page:
-        args.extend(["--page", str(page)])
+    base_args = ["bank-transactions", "list"]
+    if bank_account_id:
+        base_args.extend(["--bank-account-id", bank_account_id])
+
+    # Mode 1: explicit single-page with no date filters → legacy passthrough
+    if page is not None and not from_date and not to_date:
+        args = base_args + ["--page", str(page)]
+        txs = await _xero(args, profile=profile)
+        if isinstance(txs, list) and sort == "desc":
+            txs = sorted(txs, key=lambda t: t.get("date") or "", reverse=True)
+        return json.dumps(txs, indent=2)
+
+    # Mode 2: date-range query → walk backward from last page
+    if from_date or to_date:
+        last_page = await _find_last_page(base_args, profile=profile)
+        all_txs: list[dict] = []
+        pages_walked = 0
+        truncated_at_max_pages = False
+        # Walk backward from last_page → 1 until we drop below from_date
+        for p in range(last_page, 0, -1):
+            if pages_walked >= max_pages:
+                truncated_at_max_pages = True
+                break
+            txs = await _xero(base_args + ["--page", str(p)], profile=profile)
+            pages_walked += 1
+            if not isinstance(txs, list) or not txs:
+                continue
+            page_min_date = min((t.get("date") or "")[:10] for t in txs)
+            page_max_date = max((t.get("date") or "")[:10] for t in txs)
+            # Whole page is past the upper bound — skip (and we may be done)
+            if to_date and page_min_date and page_min_date > to_date:
+                continue
+            # Whole page is before the lower bound — we've gone past, done.
+            if from_date and page_max_date and page_max_date < from_date:
+                break
+            all_txs.extend(txs)
+
+        # Wrapper-side filters
+        if from_date:
+            all_txs = [t for t in all_txs if (t.get("date") or "")[:10] >= from_date]
+        if to_date:
+            all_txs = [t for t in all_txs if (t.get("date") or "")[:10] <= to_date]
+        if type:
+            type_u = type.upper()
+            all_txs = [t for t in all_txs if (t.get("type") or "").upper() == type_u]
+        if contact_id:
+            all_txs = [
+                t for t in all_txs
+                if (t.get("contact") or {}).get("contactID") == contact_id
+            ]
+        if sort == "desc":
+            all_txs = sorted(all_txs, key=lambda t: t.get("date") or "", reverse=True)
+        else:
+            all_txs = sorted(all_txs, key=lambda t: t.get("date") or "")
+
+        return json.dumps({
+            "count": len(all_txs),
+            "pages_walked": pages_walked,
+            "last_page_discovered": last_page,
+            "truncated_at_max_pages": truncated_at_max_pages,
+            "filters_applied": {
+                "from_date": from_date,
+                "to_date": to_date,
+                "bank_account_id": bank_account_id,
+                "type": type,
+                "contact_id": contact_id,
+            },
+            "transactions": all_txs,
+        }, indent=2)
+
+    # Mode 3: no filters, no page → return page 1 with type/contact post-filter
+    args = base_args + ["--page", "1"]
     txs = await _xero(args, profile=profile)
-    if isinstance(txs, list) and sort == "desc":
-        # Sort by date descending (newest first). 'date' is YYYY-MM-DD strings,
-        # so lexicographic sort works correctly.
-        txs = sorted(txs, key=lambda t: t.get("date") or "", reverse=True)
+    if isinstance(txs, list):
+        if type:
+            type_u = type.upper()
+            txs = [t for t in txs if (t.get("type") or "").upper() == type_u]
+        if contact_id:
+            txs = [
+                t for t in txs
+                if (t.get("contact") or {}).get("contactID") == contact_id
+            ]
+        if sort == "desc":
+            txs = sorted(txs, key=lambda t: t.get("date") or "", reverse=True)
     return json.dumps(txs, indent=2)
 
 
