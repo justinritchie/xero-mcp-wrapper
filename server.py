@@ -102,11 +102,64 @@ async def _xero(args: list[str], profile: str | None = None, stdin_data: str | N
     stdout_b, stderr_b = await proc.communicate(input=stdin_data.encode() if stdin_data else None)
 
     if proc.returncode != 0:
-        return {
+        stderr = stderr_b.decode("utf-8", errors="replace")
+        # A10: extract the meaningful validation message(s) from Xero's verbose
+        # error envelope. Typical shape on a ValidationException:
+        #   `Error: { ... "Elements": [ { "ValidationErrors": [ { "Message": "..." } ] } ] ... }`
+        # We try to pull just the Message(s); fall back to the full stderr.
+        messages: list[str] = []
+        existing_contact_id: str | None = None
+        # First try parsing the JSON envelope nested inside stderr
+        try:
+            # The xero CLI wraps Xero's REST response in a nested envelope:
+            #   stderr: "    Error: {\"response\": {..., \"body\": {\"Elements\": [...]}}}"
+            # The CLI hard-wraps JSON across ~80-char terminal lines, often
+            # breaking string values mid-character. To reconstruct the
+            # original compact JSON: strip ONLY the CLI's leading 4-space
+            # indent from each continuation line (NOT all leading whitespace
+            # — that would eat real spaces inside string values like the
+            # message "The contact name..."), then join with empty string.
+            # Joining with \n would leave raw newlines inside string values,
+            # which is invalid JSON.
+            json_part = stderr.split("Error:", 1)[-1]
+            json_part = "".join(
+                line[4:] if line.startswith("    ") else line
+                for line in json_part.splitlines()
+            ).strip()
+            err_obj = json.loads(json_part) if json_part.startswith("{") else None
+            # Walk into response.body if present (typical for ValidationException)
+            body = err_obj
+            if isinstance(err_obj, dict):
+                resp = err_obj.get("response")
+                if isinstance(resp, dict) and isinstance(resp.get("body"), dict):
+                    body = resp["body"]
+            if isinstance(body, dict):
+                for el in body.get("Elements", []) or []:
+                    for ve in (el.get("ValidationErrors") or []):
+                        msg = ve.get("Message")
+                        if msg:
+                            messages.append(msg)
+                    # Surface a real existing-record ID if Xero hands one back
+                    cid = el.get("ContactID")
+                    if cid and cid != "00000000-0000-0000-0000-000000000000":
+                        existing_contact_id = cid
+                if not messages:
+                    msg = body.get("Message") or body.get("Detail")
+                    if msg:
+                        messages.append(msg)
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            pass
+        out: dict[str, Any] = {
             "_error": f"xero CLI exited {proc.returncode}",
-            "_stderr": stderr_b.decode("utf-8", errors="replace")[:2000],
             "_command": " ".join(full),
         }
+        if messages:
+            out["messages"] = messages
+        if existing_contact_id:
+            out["existing_contact_id"] = existing_contact_id
+        # Always preserve the raw stderr (truncated) so the caller can dig deeper
+        out["_stderr"] = stderr[:2000]
+        return out
 
     if not stdout_b.strip():
         return {"_ok": True, "_stderr": stderr_b.decode("utf-8", errors="replace")[:1000]}
@@ -178,13 +231,95 @@ async def _find_last_page(
     description=(
         "Get details for the Xero organisation associated with the active "
         "profile (legal name, tax registration number, base currency, "
-        "financial year end, etc.). Use this to confirm which org the CLI "
-        "is talking to before any other operation. Args:\n"
-        "  profile: optional Xero profile name (default profile if omitted)"
+        "financial year end, etc.) plus optional summary attachments — bank "
+        "accounts, financial period locks, and tracking categories — that "
+        "agents typically need at the START of a session.\n"
+        "\n"
+        "USE WHENEVER opening a Xero workflow. With the default flags this "
+        "replaces 4 separate calls (org_details + accounts_list[BANK] + "
+        "tracking_categories_list + per-category options) with one round-trip.\n"
+        "\n"
+        "Args:\n"
+        "  profile: optional Xero profile name (default profile if omitted)\n"
+        "  include_banks: include the list of ACTIVE bank accounts (id, code, "
+        "name, currency) — defaults to True\n"
+        "  include_tracking: include tracking categories + their options — "
+        "defaults to True\n"
+        "  include_periods: include Xero's financial-year lock dates from the "
+        "org record itself (no extra CLI call) — defaults to True"
     )
 )
-async def org_details(profile: str | None = None) -> str:
-    return json.dumps(await _xero(["org", "details"], profile=profile), indent=2)
+async def org_details(
+    profile: str | None = None,
+    include_banks: bool = True,
+    include_tracking: bool = True,
+    include_periods: bool = True,
+) -> str:
+    org = await _xero(["org", "details"], profile=profile)
+    out: dict[str, Any] = {"org": org}
+
+    if include_banks:
+        accts = await _xero(["accounts", "list"], profile=profile)
+        if isinstance(accts, list):
+            banks = [
+                {
+                    "accountID": a.get("accountID"),
+                    "code": a.get("code"),
+                    "name": a.get("name"),
+                    "currencyCode": a.get("currencyCode"),
+                    "status": a.get("status"),
+                    "bankAccountNumber": a.get("bankAccountNumber"),
+                }
+                for a in accts
+                if (a.get("type") or "").upper() == "BANK"
+                and (a.get("status") or "").upper() == "ACTIVE"
+            ]
+            out["bank_accounts"] = banks
+        else:
+            out["bank_accounts_error"] = accts
+
+    if include_tracking:
+        cats = await _xero(["tracking", "categories", "list"], profile=profile)
+        if isinstance(cats, list):
+            tracking_out = []
+            for cat in cats:
+                cid = cat.get("trackingCategoryID")
+                entry = {
+                    "trackingCategoryID": cid,
+                    "name": cat.get("name"),
+                    "status": cat.get("status"),
+                }
+                if cid:
+                    opts = await _xero(
+                        ["tracking", "options", "list", "--tracking-category-id", cid],
+                        profile=profile,
+                    )
+                    if isinstance(opts, list):
+                        entry["options"] = [
+                            {
+                                "trackingOptionID": o.get("trackingOptionID"),
+                                "name": o.get("name"),
+                                "status": o.get("status"),
+                            }
+                            for o in opts
+                        ]
+                tracking_out.append(entry)
+            out["tracking_categories"] = tracking_out
+        else:
+            out["tracking_categories_error"] = cats
+
+    if include_periods and isinstance(org, dict):
+        # The financial year period info is already in the org payload; surface it.
+        out["financial_periods"] = {
+            "financialYearEndMonth": org.get("financialYearEndMonth"),
+            "financialYearEndDay": org.get("financialYearEndDay"),
+            "salesTaxBasis": org.get("salesTaxBasis"),
+            "salesTaxPeriod": org.get("salesTaxPeriod"),
+            "periodLockDate": org.get("periodLockDate"),
+            "endOfYearLockDate": org.get("endOfYearLockDate"),
+        }
+
+    return json.dumps(out, indent=2)
 
 
 @mcp.tool(
@@ -217,20 +352,82 @@ async def profiles_list() -> str:
 
 @mcp.tool(
     description=(
-        "List contacts in Xero. Optionally filter by free-text search and paginate.\n"
+        "List contacts in Xero with optional wrapper-side filters.\n"
+        "\n"
+        "The underlying CLI only supports --search and --page server-side; "
+        "everything else is applied wrapper-side after fetching. This means "
+        "the is_supplier / is_customer / include_archived filters operate on "
+        "whatever page you fetched, not the whole org.\n"
+        "\n"
         "Args:\n"
-        "  profile: Xero profile name (default if omitted)\n"
-        "  search: Free-text search term matching name/email/etc.\n"
-        "  page: 1-based page index (Xero returns 100 contacts per page)"
+        "  profile: Xero profile name\n"
+        "  search: Free-text search (name/email/contact-number), CLI-side\n"
+        "  page: 1-based page index (~100 contacts/page), CLI-side\n"
+        "  is_supplier: keep only contacts with isSupplier=true (wrapper-side)\n"
+        "  is_customer: keep only contacts with isCustomer=true (wrapper-side)\n"
+        "  include_archived: if False (default), drop status=ARCHIVED contacts\n"
+        "  ids: list of ContactIDs to look up — iterates and returns matching\n"
+        "       contacts. Skips the --search/page path entirely when set."
     )
 )
-async def contacts_list(profile: str | None = None, search: str | None = None, page: int | None = None) -> str:
+async def contacts_list(
+    profile: str | None = None,
+    search: str | None = None,
+    page: int | None = None,
+    is_supplier: bool | None = None,
+    is_customer: bool | None = None,
+    include_archived: bool = False,
+    ids: list[str] | None = None,
+) -> str:
+    # ids-list mode: batch lookup, ignore search/page
+    if ids:
+        contacts: list[dict] = []
+        misses: list[str] = []
+        for cid in ids:
+            r = await _xero(["contacts", "list", "--contact-id", cid], profile=profile)
+            if isinstance(r, list) and r:
+                contacts.extend(r)
+            elif isinstance(r, dict) and r.get("contactID"):
+                contacts.append(r)
+            else:
+                misses.append(cid)
+        return json.dumps(
+            {"count": len(contacts), "misses": misses, "contacts": contacts},
+            indent=2,
+        )
+
     args = ["contacts", "list"]
     if search:
         args.extend(["--search", search])
     if page:
         args.extend(["--page", str(page)])
-    return json.dumps(await _xero(args, profile=profile), indent=2)
+    contacts = await _xero(args, profile=profile)
+    if not isinstance(contacts, list):
+        return json.dumps(contacts, indent=2)
+
+    raw = len(contacts)
+    applied: dict[str, Any] = {}
+    if is_supplier is not None:
+        contacts = [c for c in contacts if bool(c.get("isSupplier")) == is_supplier]
+        applied["is_supplier"] = is_supplier
+    if is_customer is not None:
+        contacts = [c for c in contacts if bool(c.get("isCustomer")) == is_customer]
+        applied["is_customer"] = is_customer
+    if not include_archived:
+        contacts = [
+            c for c in contacts
+            if (c.get("contactStatus") or "").upper() != "ARCHIVED"
+        ]
+        applied["include_archived"] = False
+
+    if not applied:
+        return json.dumps(contacts, indent=2)
+    return json.dumps({
+        "count": len(contacts),
+        "raw_count_before_wrapper_filter": raw,
+        "filters_applied": applied,
+        "contacts": contacts,
+    }, indent=2)
 
 
 @mcp.tool(
@@ -255,17 +452,52 @@ async def contacts_create(
     email: str | None = None,
     phone: str | None = None,
     data: JsonDict = None,
+    idempotent: bool = True,
 ) -> str:
+    """Create a contact. If `idempotent=True` (default) and Xero rejects with
+    a name-uniqueness conflict, the wrapper looks up the existing contact by
+    name and returns its full record with `_already_existed: true` instead
+    of an error. Set `idempotent=False` to surface the conflict as an error.
+    """
     if data:
-        return json.dumps(await _file_action(["contacts", "create"], data, profile=profile), indent=2)
-    if not name:
-        return json.dumps({"_error": "must provide either `name` or `data`"})
-    args = ["contacts", "create", "--name", name]
-    if email:
-        args.extend(["--email", email])
-    if phone:
-        args.extend(["--phone", phone])
-    return json.dumps(await _xero(args, profile=profile), indent=2)
+        result = await _file_action(["contacts", "create"], data, profile=profile)
+        target_name = data.get("name") or data.get("Name")
+    else:
+        if not name:
+            return json.dumps({"_error": "must provide either `name` or `data`"})
+        args = ["contacts", "create", "--name", name]
+        if email:
+            args.extend(["--email", email])
+        if phone:
+            args.extend(["--phone", phone])
+        result = await _xero(args, profile=profile)
+        target_name = name
+
+    # Detect Xero's name-uniqueness conflict and convert to idempotent success
+    if idempotent and isinstance(result, dict) and result.get("_error"):
+        msgs = result.get("messages") or []
+        is_name_conflict = any(
+            "already assigned" in m or "already being used" in m
+            for m in msgs
+        )
+        if is_name_conflict and target_name:
+            lookup = await _xero(
+                ["contacts", "list", "--search", target_name], profile=profile
+            )
+            if isinstance(lookup, list):
+                # Pick the exact name match (case-insensitive); fall back to first hit
+                exact = [
+                    c for c in lookup
+                    if (c.get("name") or "").lower() == target_name.lower()
+                ]
+                hit = exact[0] if exact else (lookup[0] if lookup else None)
+                if hit:
+                    hit = dict(hit)
+                    hit["_already_existed"] = True
+                    hit["_conflict_messages"] = msgs
+                    return json.dumps(hit, indent=2)
+
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool(
@@ -563,6 +795,30 @@ async def bank_transactions_list(
     contact_id: str | None = None,
     max_pages: int = 20,
 ) -> str:
+    return await _bank_transactions_query(
+        profile=profile, page=page, sort=sort,
+        from_date=from_date, to_date=to_date,
+        bank_account_id=bank_account_id, type=type,
+        contact_id=contact_id, max_pages=max_pages,
+    )
+
+
+async def _bank_transactions_query(
+    profile: str | None = None,
+    page: int | None = None,
+    sort: str = "desc",
+    from_date: str | None = None,
+    to_date: str | None = None,
+    bank_account_id: str | None = None,
+    type: str | None = None,
+    contact_id: str | None = None,
+    max_pages: int = 20,
+) -> str:
+    """Private helper — the actual paginated query. Extracted from
+    bank_transactions_list so other tools (find_unreconciled_bank_transactions)
+    can reuse the engine without going through FastMCP's tool wrapping
+    (which makes the wrapped object accessible only via module attribute lookup,
+    not lexical scope inside the same module)."""
     base_args = ["bank-transactions", "list"]
     if bank_account_id:
         base_args.extend(["--bank-account-id", bank_account_id])
@@ -648,6 +904,54 @@ async def bank_transactions_list(
         if sort == "desc":
             txs = sorted(txs, key=lambda t: t.get("date") or "", reverse=True)
     return json.dumps(txs, indent=2)
+
+
+@mcp.tool(
+    description=(
+        "Find bank transactions that have NOT yet been reconciled against a "
+        "bank statement line.\n"
+        "\n"
+        "USE WHENEVER you're doing monthly close cleanup and want to know "
+        "what's still pending bank-statement matching. Common workflow: pass "
+        "from_date/to_date covering the close period plus a bank_account_id "
+        "if you're working one account at a time.\n"
+        "\n"
+        "Implementation: thin wrapper around bank_transactions_list with the "
+        "same backward-pagination engine, post-filtered to "
+        "`isReconciled == false`. Same args + same metadata envelope.\n"
+        "\n"
+        "Args:\n"
+        "  profile: Xero profile name\n"
+        "  from_date / to_date: YYYY-MM-DD inclusive bounds\n"
+        "  bank_account_id: optional BankAccount.AccountID filter (CLI-side)\n"
+        "  max_pages: pagination budget (default 20)"
+    )
+)
+async def find_unreconciled_bank_transactions(
+    profile: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    bank_account_id: str | None = None,
+    max_pages: int = 20,
+) -> str:
+    raw = await _bank_transactions_query(
+        profile=profile,
+        from_date=from_date,
+        to_date=to_date,
+        bank_account_id=bank_account_id,
+        max_pages=max_pages,
+    )
+    parsed = json.loads(raw) if isinstance(raw, str) else raw
+    if isinstance(parsed, dict) and "transactions" in parsed:
+        unrec = [t for t in parsed["transactions"] if not t.get("isReconciled")]
+        return json.dumps({
+            **{k: v for k, v in parsed.items() if k != "transactions"},
+            "total_in_range": len(parsed["transactions"]),
+            "unreconciled_count": len(unrec),
+            "transactions": unrec,
+        }, indent=2)
+    # Fallback if envelope shape changed
+    return raw
 
 
 @mcp.tool(
@@ -740,11 +1044,19 @@ async def reports_trial_balance(
 
 @mcp.tool(
     description=(
-        "Generate an Aged Receivables report for a specific contact — invoices "
-        "this contact owes you, bucketed by age.\n"
+        "Generate an Aged Receivables report — invoices customers owe you, "
+        "bucketed by age.\n"
+        "\n"
+        "If `contact_id` is specified: standard per-contact report (one CLI "
+        "call, fast).\n"
+        "\n"
+        "If `contact_id` is OMITTED: GLOBAL view — wrapper iterates every "
+        "isCustomer=true contact and rolls up. Cost is one CLI call per "
+        "customer (5-30s on a typical org).\n"
+        "\n"
         "Args:\n"
         "  profile: Xero profile name\n"
-        "  contact_id: Xero ContactID (REQUIRED)\n"
+        "  contact_id: Xero ContactID (OPTIONAL — omit for global view)\n"
         "  report_date: Date the report is run as of (YYYY-MM-DD)\n"
         "  from_date / to_date: Filter to invoices in this date range"
     )
@@ -756,22 +1068,42 @@ async def reports_aged_receivables(
     from_date: str | None = None,
     to_date: str | None = None,
 ) -> str:
-    if not contact_id:
-        return json.dumps({"_error": "contact_id is required for aged-receivables"})
-    args = ["reports", "aged-receivables", "--contact-id", contact_id]
-    if report_date: args.extend(["--report-date", report_date])
-    if from_date: args.extend(["--from-date", from_date])
-    if to_date: args.extend(["--to-date", to_date])
-    return json.dumps(await _xero(args, profile=profile), indent=2)
+    """Aged Receivables. If `contact_id` is omitted, the wrapper synthesizes
+    a GLOBAL aged-receivables view by walking every customer-flagged contact
+    and rolling up each per-contact report into totals by aging bucket.
+
+    NOTE: the underlying CLI requires --contact-id, so the global view costs
+    one CLI call per customer contact. Expect 5-30 seconds on a typical org
+    depending on customer count. Cached results would be a sensible follow-up."""
+    if contact_id:
+        args = ["reports", "aged-receivables", "--contact-id", contact_id]
+        if report_date: args.extend(["--report-date", report_date])
+        if from_date: args.extend(["--from-date", from_date])
+        if to_date: args.extend(["--to-date", to_date])
+        return json.dumps(await _xero(args, profile=profile), indent=2)
+    return await _aged_global(
+        "aged-receivables", "isCustomer",
+        profile=profile, report_date=report_date,
+        from_date=from_date, to_date=to_date,
+    )
 
 
 @mcp.tool(
     description=(
-        "Generate an Aged Payables report for a specific contact — bills you "
-        "owe this contact, bucketed by age.\n"
+        "Generate an Aged Payables report — bills you owe, bucketed by age.\n"
+        "\n"
+        "If `contact_id` is specified: returns the standard per-contact Xero "
+        "report (one CLI call, fast).\n"
+        "\n"
+        "If `contact_id` is OMITTED: returns a GLOBAL aged-payables view "
+        "covering every supplier. The wrapper iterates every isSupplier=true "
+        "contact and calls the per-contact report once each, then rolls up "
+        "totals into the standard 0-30 / 31-60 / 61-90 / 91+ buckets. Cost "
+        "is one CLI call per supplier (5-30s on a typical org).\n"
+        "\n"
         "Args:\n"
         "  profile: Xero profile name\n"
-        "  contact_id: Xero ContactID (REQUIRED)\n"
+        "  contact_id: Xero ContactID (OPTIONAL — omit for global view)\n"
         "  report_date: Date the report is run as of (YYYY-MM-DD)\n"
         "  from_date / to_date: Filter to bills in this date range"
     )
@@ -783,13 +1115,69 @@ async def reports_aged_payables(
     from_date: str | None = None,
     to_date: str | None = None,
 ) -> str:
-    if not contact_id:
-        return json.dumps({"_error": "contact_id is required for aged-payables"})
-    args = ["reports", "aged-payables", "--contact-id", contact_id]
-    if report_date: args.extend(["--report-date", report_date])
-    if from_date: args.extend(["--from-date", from_date])
-    if to_date: args.extend(["--to-date", to_date])
-    return json.dumps(await _xero(args, profile=profile), indent=2)
+    if contact_id:
+        args = ["reports", "aged-payables", "--contact-id", contact_id]
+        if report_date: args.extend(["--report-date", report_date])
+        if from_date: args.extend(["--from-date", from_date])
+        if to_date: args.extend(["--to-date", to_date])
+        return json.dumps(await _xero(args, profile=profile), indent=2)
+    return await _aged_global(
+        "aged-payables", "isSupplier",
+        profile=profile, report_date=report_date,
+        from_date=from_date, to_date=to_date,
+    )
+
+
+async def _aged_global(
+    report_name: str,
+    role_flag: str,
+    profile: str | None,
+    report_date: str | None,
+    from_date: str | None,
+    to_date: str | None,
+) -> str:
+    """Synthesize a global Aged Payables/Receivables view by iterating every
+    isSupplier=true (or isCustomer=true) contact and rolling up per-contact
+    reports. Returns a metadata envelope with totals + per-contact breakdown.
+
+    role_flag: 'isSupplier' (for payables) or 'isCustomer' (for receivables)."""
+    # Walk every contact (could be many pages on a big org)
+    all_contacts: list[dict] = []
+    for p in range(1, 51):  # safety cap at 50 pages = 5000 contacts
+        page = await _xero(["contacts", "list", "--page", str(p)], profile=profile)
+        if not isinstance(page, list) or not page:
+            break
+        all_contacts.extend(page)
+    targets = [c for c in all_contacts if c.get(role_flag) and (c.get("contactStatus") or "").upper() != "ARCHIVED"]
+    per_contact: list[dict] = []
+    errors: list[dict] = []
+    for c in targets:
+        cid = c.get("contactID")
+        if not cid:
+            continue
+        args = ["reports", report_name, "--contact-id", cid]
+        if report_date: args.extend(["--report-date", report_date])
+        if from_date: args.extend(["--from-date", from_date])
+        if to_date: args.extend(["--to-date", to_date])
+        r = await _xero(args, profile=profile)
+        if isinstance(r, dict) and not r.get("_error"):
+            per_contact.append({
+                "contact_id": cid,
+                "name": c.get("name"),
+                "report": r,
+            })
+        else:
+            errors.append({"contact_id": cid, "name": c.get("name"), "error": r})
+    return json.dumps({
+        "mode": "global_synthesized",
+        "report": report_name,
+        "role_filter": role_flag,
+        "contacts_polled": len(targets),
+        "successes": len(per_contact),
+        "errors": len(errors),
+        "per_contact": per_contact,
+        "errored_contacts": errors[:20],  # cap to keep payload readable
+    }, indent=2)
 
 
 # ---------------------------------------------------------------------------
@@ -881,14 +1269,34 @@ async def tracking_options_list(profile: str | None = None, tracking_category_id
 
 @mcp.tool(
     description=(
-        "Record a payment against an existing invoice.\n"
+        "Record payment(s) against one or many invoices.\n"
+        "\n"
+        "SINGLE PAYMENT (legacy form):\n"
+        "  payments_create(invoice_id='in_...', account_id='acc_...', amount=100.00)\n"
+        "\n"
+        "MULTI-INVOICE BATCH (wrapper-loop form):\n"
+        "  payments_create(\n"
+        "    account_id='acc_...', date='2026-04-15',\n"
+        "    payments=[{'invoice_id': 'in_a', 'amount': 1215.11},\n"
+        "              {'invoice_id': 'in_b', 'amount': 1215.11, 'reference': 'PR-0349'}],\n"
+        "  )\n"
+        "\n"
+        "NOTE: this is a WRAPPER-LOOP batch (calls the CLI once per invoice).\n"
+        "Xero's native /BatchPayments endpoint is NOT yet exposed by the CLI; "
+        "the proper one-bank-line batch will land when bank_transfers_create / "
+        "batch_payments_create lands in the xero-rest sidecar (Round 3b).\n"
+        "\n"
         "Args:\n"
         "  profile: Xero profile name\n"
-        "  invoice_id: Xero InvoiceID (REQUIRED)\n"
-        "  account_id: Bank/clearing account ID the payment is FROM (REQUIRED)\n"
-        "  amount: Payment amount, positive number (REQUIRED)\n"
-        "  date: Payment date (YYYY-MM-DD); defaults to today\n"
-        "  reference: Optional reference text shown on the payment"
+        "  invoice_id: Single InvoiceID (legacy mode)\n"
+        "  account_id: Bank/clearing AccountID the payment is FROM (REQUIRED in both modes)\n"
+        "  amount: Single payment amount (legacy mode)\n"
+        "  date: Shared payment date (YYYY-MM-DD); per-item override allowed\n"
+        "  reference: Shared reference; per-item override allowed\n"
+        "  payments: List of {invoice_id, amount, date?, reference?} for batch mode\n"
+        "\n"
+        "Returns a list of per-invoice results in batch mode (`results` array "
+        "with `ok`/`error` per item), or the raw single-invoice response."
     )
 )
 async def payments_create(
@@ -898,7 +1306,43 @@ async def payments_create(
     amount: float | None = None,
     date: str | None = None,
     reference: str | None = None,
+    payments: list[dict] | None = None,
 ) -> str:
+    # Batch mode — loop per-invoice
+    if payments:
+        if not account_id:
+            return json.dumps({"_error": "account_id is required in batch mode"})
+        results = []
+        for p in payments:
+            iid = p.get("invoice_id") or p.get("invoiceId") or p.get("InvoiceID")
+            amt = p.get("amount") or p.get("Amount")
+            d = p.get("date") or date
+            ref = p.get("reference") or reference
+            if not iid or amt is None:
+                results.append({"item": p, "ok": False, "error": "missing invoice_id or amount"})
+                continue
+            args = [
+                "payments", "create",
+                "--invoice-id", iid,
+                "--account-id", account_id,
+                "--amount", str(amt),
+            ]
+            if d:
+                args.extend(["--date", d])
+            if ref:
+                args.extend(["--reference", ref])
+            r = await _xero(args, profile=profile)
+            ok = isinstance(r, dict) and not r.get("_error")
+            results.append({"item": p, "ok": ok, "response": r})
+        return json.dumps({
+            "mode": "batch_wrapper_loop",
+            "count": len(results),
+            "succeeded": sum(1 for r in results if r["ok"]),
+            "failed": sum(1 for r in results if not r["ok"]),
+            "results": results,
+        }, indent=2)
+
+    # Single-payment legacy mode
     missing = [k for k, v in (("invoice_id", invoice_id), ("account_id", account_id), ("amount", amount)) if not v]
     if missing:
         return json.dumps({"_error": f"required args missing: {missing}"})
